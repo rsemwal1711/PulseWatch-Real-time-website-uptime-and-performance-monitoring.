@@ -13,6 +13,11 @@ const ALLOWED_INTERVALS = new Set([60, 300, 600]);
 const ALLOWED_TIMEOUTS = new Set([5, 10, 20]);
 const MAX_CHECK_HISTORY = 5000;
 const MAX_REDIRECTS = 5;
+const ANALYTICS_RANGES = {
+  '24h': { durationMs: 24 * 60 * 60 * 1000, buckets: 24 },
+  '7d': { durationMs: 7 * 24 * 60 * 60 * 1000, buckets: 28 },
+  '30d': { durationMs: 30 * 24 * 60 * 60 * 1000, buckets: 30 },
+};
 
 export function isPublicAddress(address) {
   const version = isIP(address);
@@ -196,6 +201,109 @@ export function statusFromCheck(check, expectedStatuses) {
   return check.responseMs >= 1000 ? 'Degraded' : 'Operational';
 }
 
+export function buildIncidents(monitors, now = Date.now()) {
+  const incidents = [];
+  for (const monitor of monitors) {
+    let activeIncident;
+    const checks = [...monitor.checks].sort((left, right) =>
+      Date.parse(left.checkedAt) - Date.parse(right.checkedAt));
+    for (const check of checks) {
+      const checkedAt = Date.parse(check.checkedAt);
+      if (!Number.isFinite(checkedAt)) continue;
+      const isDown = Boolean(check.error) || !monitor.expectedStatuses.includes(check.statusCode);
+      if (isDown && !activeIncident) {
+        activeIncident = {
+          id: `${monitor.id}-${check.checkedAt}`,
+          monitorId: monitor.id,
+          website: monitor.name,
+          url: monitor.url,
+          status: 'Ongoing',
+          startedAt: check.checkedAt,
+          resolvedAt: null,
+          durationMs: 0,
+          detail: check.error || `Received HTTP ${check.statusCode}.`,
+        };
+      } else if (!isDown && activeIncident) {
+        activeIncident.status = 'Resolved';
+        activeIncident.resolvedAt = check.checkedAt;
+        activeIncident.durationMs = Math.max(0, checkedAt - Date.parse(activeIncident.startedAt));
+        incidents.push(activeIncident);
+        activeIncident = null;
+      }
+    }
+    if (activeIncident) {
+      activeIncident.durationMs = Math.max(0, now - Date.parse(activeIncident.startedAt));
+      incidents.push(activeIncident);
+    }
+  }
+  return incidents.sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt));
+}
+
+export function summarizeAnalytics(monitors, range, now = Date.now()) {
+  const configuration = ANALYTICS_RANGES[range];
+  if (!configuration) throw new Error('Choose a range of 24h, 7d, or 30d.');
+  const since = now - configuration.durationMs;
+  const bucketMs = configuration.durationMs / configuration.buckets;
+  const buckets = Array.from({ length: configuration.buckets }, (_, index) => ({
+    timestamp: since + index * bucketMs,
+    checks: 0,
+    successfulChecks: 0,
+    responseTotal: 0,
+    responseCount: 0,
+  }));
+  let checksCount = 0;
+  let successfulChecks = 0;
+  let responseTotal = 0;
+  let responseCount = 0;
+
+  for (const monitor of monitors) {
+    for (const check of monitor.checks) {
+      const checkedAt = Date.parse(check.checkedAt);
+      if (!Number.isFinite(checkedAt) || checkedAt < since || checkedAt > now) continue;
+      const isSuccessful = !check.error && monitor.expectedStatuses.includes(check.statusCode);
+      const index = Math.min(
+        configuration.buckets - 1,
+        Math.floor((checkedAt - since) / bucketMs),
+      );
+      const bucket = buckets[index];
+      checksCount += 1;
+      bucket.checks += 1;
+      if (isSuccessful) {
+        successfulChecks += 1;
+        bucket.successfulChecks += 1;
+        if (Number.isFinite(check.responseMs)) {
+          responseTotal += check.responseMs;
+          responseCount += 1;
+          bucket.responseTotal += check.responseMs;
+          bucket.responseCount += 1;
+        }
+      }
+    }
+  }
+
+  const incidents = buildIncidents(monitors, now);
+  const downtimeMs = incidents.reduce((total, incident) => {
+    const start = Math.max(since, Date.parse(incident.startedAt));
+    const end = Math.min(now, incident.resolvedAt ? Date.parse(incident.resolvedAt) : now);
+    return total + Math.max(0, end - start);
+  }, 0);
+
+  return {
+    range,
+    generatedAt: new Date(now).toISOString(),
+    checksCount,
+    uptime: checksCount ? (successfulChecks / checksCount) * 100 : null,
+    averageResponseMs: responseCount ? responseTotal / responseCount : null,
+    estimatedDowntimeMs: downtimeMs,
+    points: buckets.filter((bucket) => bucket.checks > 0).map((bucket) => ({
+      timestamp: new Date(bucket.timestamp).toISOString(),
+      uptime: (bucket.successfulChecks / bucket.checks) * 100,
+      averageResponseMs: bucket.responseCount ? bucket.responseTotal / bucket.responseCount : null,
+      checksCount: bucket.checks,
+    })),
+  };
+}
+
 function relativeTime(timestamp) {
   if (!timestamp) return 'Never';
   const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(timestamp)) / 1000));
@@ -347,6 +455,19 @@ export async function createAppServer({
     }
     if (url.pathname === '/api/monitors' && request.method === 'GET') {
       sendJson(response, 200, { monitors: monitors.map(serializeMonitor) });
+      return;
+    }
+    if (url.pathname === '/api/analytics' && request.method === 'GET') {
+      const range = url.searchParams.get('range') || '24h';
+      if (!ANALYTICS_RANGES[range]) {
+        sendJson(response, 400, { error: 'Choose a range of 24h, 7d, or 30d.' });
+        return;
+      }
+      sendJson(response, 200, { analytics: summarizeAnalytics(monitors, range) });
+      return;
+    }
+    if (url.pathname === '/api/incidents' && request.method === 'GET') {
+      sendJson(response, 200, { incidents: buildIncidents(monitors) });
       return;
     }
     if (url.pathname === '/api/monitors' && request.method === 'POST') {

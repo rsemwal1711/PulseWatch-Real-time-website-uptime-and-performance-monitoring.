@@ -26,6 +26,14 @@ async function request(path, options = {}) {
   return body;
 }
 
+export async function fetchAnalytics(range) {
+  return (await request(`/analytics?range=${encodeURIComponent(range)}`)).analytics;
+}
+
+export async function fetchIncidents() {
+  return (await request('/incidents')).incidents;
+}
+
 export function MonitorProvider({ children }) {
   const [monitors, setMonitors] = useState([]);
   const [loading, setLoading] = useState(true);
